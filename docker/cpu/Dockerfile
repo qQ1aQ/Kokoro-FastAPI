@@ -56,7 +56,7 @@ ENV PYTHONUNBUFFERED=1 \
     ESPEAK_DATA_PATH=/usr/share/espeak-ng-data \
     PATH="/app/.venv/bin:/root/.cargo/bin:$PATH" \
     DEVICE="cpu" \
-    DOWNLOAD_MODEL=true # Combined with other ENVs
+    DOWNLOAD_MODEL=true 
 
 # Download model if enabled - MOVED AFTER uv sync and dependency installation
 RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
