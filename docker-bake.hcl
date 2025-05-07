@@ -4,11 +4,11 @@ variable "VERSION" {
 }
 
 variable "REGISTRY" {
-    default = "ghcr.io"
+    default =  "docker.io" # Change
 }
 
 variable "OWNER" {
-    default = "remsky"
+    default = "qq1aq"
 }
 
 variable "REPO" {
