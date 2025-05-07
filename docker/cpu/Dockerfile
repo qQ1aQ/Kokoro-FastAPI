@@ -23,9 +23,6 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 RUN apt-get update && apt-get install -y curl && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 
-# Add the Rust cargo bin directory to the PATH for future layers
-ENV PATH="/root/.cargo/bin:$PATH"
-
 # Create non-root user and set up directories and permissions
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /app/api/src/models/v1_0 && \
@@ -49,25 +46,22 @@ COPY --chown=appuser:appuser web ./web
 COPY --chown=appuser:appuser docker/scripts/ ./
 RUN chmod +x ./entrypoint.sh
 
-# Set environment variables that don't include adding to the PATH yet
+# Set environment variables including the combined PATH
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app:/app/api \
     UV_LINK_MODE=copy \
     USE_GPU=false \
     PHONEMIZER_ESPEAK_PATH=/usr/bin \
     PHONEMIZER_ESPEAK_DATA=/usr/share/espeak-ng-data \
-    ESPEAK_DATA_PATH=/usr/share/espeak-ng-data
+    ESPEAK_DATA_PATH=/usr/share/espeak-ng-data \
+    PATH="/app/.venv/bin:/root/.cargo/bin:$PATH" \
+    DEVICE="cpu" \
+    DOWNLOAD_MODEL=true # Combined with other ENVs
 
-# Set the final PATH including the virtual environment and Rust cargo bin
-ENV PATH="/app/.venv/bin:/root/.cargo/bin:$PATH"
-
-
-ENV DOWNLOAD_MODEL=true
-# Download model if enabled - MOVED AFTER uv sync
+# Download model if enabled - MOVED AFTER uv sync and dependency installation
 RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
     python download_model.py --output api/src/models/v1_0; \
     fi
 
-ENV DEVICE="cpu"
 # Run FastAPI server through entrypoint.sh
 CMD ["./entrypoint.sh"]
