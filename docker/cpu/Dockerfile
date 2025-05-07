@@ -24,7 +24,7 @@ FROM python:3.10-slim
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 
     # Add the Rust cargo bin directory to the PATH for future layers
-    ENV PATH="/root/.cargo/bin:$PATH" # <-- Add this line here!
+    ENV PATH="/root/.cargo/bin:$PATH" 
 
     # Create non-root user and set up directories and permissions
     RUN useradd -m -u 1000 appuser && \
