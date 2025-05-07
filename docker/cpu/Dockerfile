@@ -1,4 +1,4 @@
-FROM python:3.10-slim 
+FROM python:3.10-slim
 
 # Install dependencies and check espeak location
 RUN apt-get update && apt-get install -y \
@@ -9,15 +9,22 @@ RUN apt-get update && apt-get install -y \
     curl \
     ffmpeg \
     g++ \
-&& apt-get clean \
-&& rm -rf /var/lib/apt/lists/* \
-&& mkdir -p /usr/share/espeak-ng-data \
-&& ln -s /usr/lib/*/espeak-ng-data/* /usr/share/espeak-ng-data/
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /usr/share/espeak-ng-data \
+ && ln -s /usr/lib/*/espeak-ng-data/* /usr/share/espeak-ng-data/
 
 # Install UV using the installer script
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uv /usr/local/bin/ && \
     mv /root/.local/bin/uvx /usr/local/bin/
+
+# Install Rust for sudachipy and other potential Rust-based dependencies
+# Add this block here, before the uv sync command
+RUN apt-get update && apt-get install -y curl && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+    export PATH="/root/.cargo/bin:$PATH"
+
 
 # Create non-root user and set up directories and permissions
 RUN useradd -m -u 1000 appuser && \
@@ -31,6 +38,7 @@ WORKDIR /app
 COPY --chown=appuser:appuser pyproject.toml ./pyproject.toml
 
 # Install dependencies
+# This command now has Rust available in the PATH
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv --python 3.10 && \
     uv sync --extra cpu
