@@ -1,6 +1,7 @@
 name: kokoro-fastapi-cpu
 services:
   kokoro-tts:
+    image: qq1aq/kokoro-fastapi-cpu:v${VERSION} # Add this line
     build:
       context: ../..
       dockerfile: docker/cpu/Dockerfile
