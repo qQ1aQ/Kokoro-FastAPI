@@ -1,6 +1,8 @@
 FROM python:3.10-slim
 
-# Install system dependencies for espeak, build tools, etc.
+# STAGE 1: Build dependencies as root
+
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     espeak-ng \
     espeak-ng-data \
@@ -23,35 +25,45 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 RUN apt-get update && apt-get install -y curl && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 
-# IMPORTANT: Add Rust's cargo bin to the PATH for subsequent RUN commands in this stage.
-# This ensures 'rustc' is found when 'uv sync' builds Rust-dependent packages like sudachipy.
+# Add Rust's cargo bin to the PATH for this stage (while still root)
 ENV PATH="/root/.cargo/bin:$PATH"
 
-# Create non-root user and work directory
-RUN useradd -m -u 1000 appuser && \
-    mkdir -p /app/api/src/models/v1_0 && \
-    chown -R appuser:appuser /app
-
-USER appuser
+# Create application and model directory (still as root)
+RUN mkdir -p /app/api/src/models/v1_0
 WORKDIR /app
 
-# Copy dependency files (pyproject.toml)
-COPY --chown=appuser:appuser pyproject.toml ./pyproject.toml
+# Copy dependency file (pyproject.toml)
+COPY pyproject.toml ./pyproject.toml
 
-# Install Python dependencies using uv.
-# The PATH (set by the ENV instruction above) now includes /root/.cargo/bin.
+# Install Python dependencies using uv (as root)
+# The PATH (set by the ENV instruction above) now includes /root/.cargo/bin,
+# so sudachipy should compile correctly.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv --python 3.10 && \
     uv sync --extra cpu
 
-# Copy project files
+# STAGE 2: Setup appuser, copy application files, and run as appuser
+
+# Create non-root user
+# This is done AFTER installing dependencies that might need root or go into root's home.
+RUN useradd -m -s /bin/bash -u 1000 appuser
+
+# Change ownership of the /app directory (including .venv and models dir) to appuser
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+WORKDIR /app # Current directory is already /app, this reinforces context for appuser
+
+# Copy project files (as appuser, using --chown for safety from build context)
 COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser web ./web
 COPY --chown=appuser:appuser docker/scripts/ ./
 RUN chmod +x ./entrypoint.sh
 
-# Set final environment variables for the application.
-# This will prepend /app/.venv/bin to the PATH that already includes /root/.cargo/bin from the ENV above.
+# Set final environment variables for the application (as appuser)
+# This PATH prepends the virtual environment's bin to appuser's default PATH.
+# Rust tools are not needed in the PATH for appuser at runtime.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app:/app/api \
     UV_LINK_MODE=copy \
@@ -63,10 +75,10 @@ ENV PYTHONUNBUFFERED=1 \
     DEVICE="cpu" \
     DOWNLOAD_MODEL=true
 
-# Download model (after all dependencies are installed and PATH includes .venv)
+# Download model (as appuser)
 RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
     python download_model.py --output api/src/models/v1_0; \
     fi
 
-# Define the entrypoint
+# Define the entrypoint (will run as appuser)
 CMD ["./entrypoint.sh"]
