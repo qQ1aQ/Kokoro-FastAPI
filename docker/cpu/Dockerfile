@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install dependencies and check espeak location
+# Install system dependencies for espeak, build tools, etc.
 RUN apt-get update && apt-get install -y \
     espeak-ng \
     espeak-ng-data \
@@ -14,16 +14,20 @@ RUN apt-get update && apt-get install -y \
  && mkdir -p /usr/share/espeak-ng-data \
  && ln -s /usr/lib/*/espeak-ng-data/* /usr/share/espeak-ng-data/
 
-# Install UV using the installer script
+# Install UV (Python package manager)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uv /usr/local/bin/ && \
     mv /root/.local/bin/uvx /usr/local/bin/
 
-# Install Rust for sudachipy and other potential Rust-based dependencies
+# Install Rust
 RUN apt-get update && apt-get install -y curl && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 
-# Create non-root user and set up directories and permissions
+# IMPORTANT: Add Rust's cargo bin to the PATH for subsequent RUN commands in this stage.
+# This ensures 'rustc' is found when 'uv sync' builds Rust-dependent packages like sudachipy.
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# Create non-root user and work directory
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /app/api/src/models/v1_0 && \
     chown -R appuser:appuser /app
@@ -31,22 +35,23 @@ RUN useradd -m -u 1000 appuser && \
 USER appuser
 WORKDIR /app
 
-# Copy dependency files
+# Copy dependency files (pyproject.toml)
 COPY --chown=appuser:appuser pyproject.toml ./pyproject.toml
 
-# Install dependencies
-# The PATH now includes the Rust compiler directory when this RUN command executes
+# Install Python dependencies using uv.
+# The PATH (set by the ENV instruction above) now includes /root/.cargo/bin.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv --python 3.10 && \
     uv sync --extra cpu
 
-# Copy project files including models
+# Copy project files
 COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser web ./web
 COPY --chown=appuser:appuser docker/scripts/ ./
 RUN chmod +x ./entrypoint.sh
 
-# Set environment variables including the combined PATH
+# Set final environment variables for the application.
+# This will prepend /app/.venv/bin to the PATH that already includes /root/.cargo/bin from the ENV above.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app:/app/api \
     UV_LINK_MODE=copy \
@@ -54,14 +59,14 @@ ENV PYTHONUNBUFFERED=1 \
     PHONEMIZER_ESPEAK_PATH=/usr/bin \
     PHONEMIZER_ESPEAK_DATA=/usr/share/espeak-ng-data \
     ESPEAK_DATA_PATH=/usr/share/espeak-ng-data \
-    PATH="/app/.venv/bin:/root/.cargo/bin:$PATH" \
+    PATH="/app/.venv/bin:$PATH" \
     DEVICE="cpu" \
-    DOWNLOAD_MODEL=true 
+    DOWNLOAD_MODEL=true
 
-# Download model if enabled - MOVED AFTER uv sync and dependency installation
+# Download model (after all dependencies are installed and PATH includes .venv)
 RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
     python download_model.py --output api/src/models/v1_0; \
     fi
 
-# Run FastAPI server through entrypoint.sh
+# Define the entrypoint
 CMD ["./entrypoint.sh"]
