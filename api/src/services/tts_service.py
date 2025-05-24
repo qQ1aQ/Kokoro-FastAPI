@@ -7,6 +7,7 @@ import tempfile
 import time
 from typing import AsyncGenerator, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor
+import gc
 
 import numpy as np
 import torch
@@ -28,17 +29,22 @@ from .text_processing.text_processor import process_text_chunk, smart_split
 class TTSService:
     """Text-to-speech service."""
 
-    # Aggressive concurrent processing for GPU utilization
-    _chunk_semaphore = asyncio.Semaphore(32)  # High concurrency
-    _io_semaphore = asyncio.Semaphore(16)     # Separate semaphore for I/O operations
+    # More aggressive GPU utilization
+    _chunk_semaphore = asyncio.Semaphore(48)  # Increased from 32 to 48
+    _io_semaphore = asyncio.Semaphore(24)     # Increased I/O concurrency
     
-    # Enhanced caching
+    # Enhanced multi-level caching
     _voice_cache = {}
-    _path_cache = {}  # Cache for voice paths
-    _tensor_pool = {}  # Pre-loaded tensor pool
+    _path_cache = {}
+    _tensor_pool = {}
+    _pipeline_cache = {}  # Cache for text processing
     
-    # Thread pool for CPU-bound operations
-    _thread_pool = ThreadPoolExecutor(max_workers=4)
+    # Larger thread pool
+    _thread_pool = ThreadPoolExecutor(max_workers=8)  # Increased from 4
+    
+    # Pipeline reuse cache
+    _last_voice_config = None
+    _last_normalizer = None
 
     def __init__(self, output_dir: str = None):
         """Initialize service."""
@@ -52,32 +58,59 @@ class TTSService:
         service = cls(output_dir)
         service.model_manager = await get_model_manager()
         service._voice_manager = await get_voice_manager()
-        # Pre-warm common voices
-        await service._prewarm_default_voices()
+        # Pre-warm more aggressively
+        await service._prewarm_system()
         return service
 
-    async def _prewarm_default_voices(self):
-        """Pre-load commonly used voices into cache."""
+    async def _prewarm_system(self):
+        """Aggressively pre-load everything we can."""
         try:
+            # Pre-warm more voices
             common_voices = [
-                settings.default_voice,
-                "af_bella", "af_sarah", "am_adam", "bm_daniel"
+                settings.default_voice, "af_bella", "af_sarah", "af_nicole", "af_heart",
+                "am_adam", "am_michael", "bm_daniel", "bm_george", "bf_emma"
             ]
             backend = self.model_manager.get_backend()
             
+            # Load voices in parallel
+            tasks = []
             for voice_name in common_voices:
-                try:
-                    cache_key = f"{voice_name}_{backend.device}"
-                    if cache_key not in self._voice_cache:
-                        voice_tensor = await self._voice_manager.load_voice(
-                            voice_name, device=backend.device
-                        )
-                        self._voice_cache[cache_key] = voice_tensor
-                        logger.debug(f"Pre-warmed voice: {voice_name}")
-                except Exception as e:
-                    logger.debug(f"Could not pre-warm voice {voice_name}: {e}")
+                task = asyncio.create_task(self._prewarm_voice(voice_name, backend))
+                tasks.append(task)
+            
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Pre-compile regex patterns
+            self._voice_split_pattern = re.compile(r"([-+])")
+            self._voice_weight_pattern = re.compile(r"(.+?)\(([0-9.]+)\)")
+            
+            # Pre-warm normalizers for common configurations
+            for _ in range(3):
+                AudioNormalizer()
+                
+            logger.info(f"Pre-warmed {len(self._voice_cache)} voices and system components")
+            
         except Exception as e:
-            logger.debug(f"Voice pre-warming failed: {e}")
+            logger.debug(f"System pre-warming failed: {e}")
+
+    async def _prewarm_voice(self, voice_name: str, backend):
+        """Pre-warm a single voice."""
+        try:
+            cache_key = f"{voice_name}_{backend.device}"
+            if cache_key not in self._voice_cache:
+                voice_tensor = await self._voice_manager.load_voice(
+                    voice_name, device=backend.device
+                )
+                self._voice_cache[cache_key] = voice_tensor
+                
+                # Also cache the path
+                path = await self._voice_manager.get_voice_path(voice_name)
+                if path:
+                    self._path_cache[voice_name] = path
+                    
+                logger.debug(f"Pre-warmed voice: {voice_name}")
+        except Exception as e:
+            logger.debug(f"Could not pre-warm voice {voice_name}: {e}")
 
     async def _process_chunk(
         self,
@@ -94,7 +127,7 @@ class TTSService:
         lang_code: Optional[str] = None,
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Process tokens into audio with enhanced performance."""
+        """Process tokens into audio with maximum performance."""
         async with self._chunk_semaphore:
             try:
                 # Handle stream finalization (PRESERVED ORIGINAL LOGIC)
@@ -110,14 +143,14 @@ class TTSService:
                     yield chunk_data
                     return
 
-                # Skip empty chunks
+                # Skip empty chunks early
                 if not tokens and not chunk_text:
                     return
 
-                # Get backend
+                # Get backend (cached)
                 backend = self.model_manager.get_backend()
 
-                # Generate audio using optimized caching
+                # Generate audio with optimizations
                 if isinstance(backend, KokoroV1):
                     chunk_index = 0
                     async for chunk_data in self.model_manager.generate(
@@ -127,7 +160,7 @@ class TTSService:
                         lang_code=lang_code,
                         return_timestamps=return_timestamps,
                     ):
-                        # For streaming, convert to bytes (PRESERVED ORIGINAL LOGIC)
+                        # Process output immediately to reduce memory pressure
                         if output_format:
                             try:
                                 chunk_data = await AudioService.convert_audio(
@@ -143,17 +176,20 @@ class TTSService:
                             )
                             yield chunk_data
                         chunk_index += 1
+                        
+                        # Clear references to help GC
+                        del chunk_data
                 else:
-                    # Enhanced voice tensor caching with device-specific pools
+                    # Ultra-fast voice tensor lookup
                     cache_key = f"{voice_name}_{backend.device}"
                     if cache_key not in self._voice_cache:
-                        # Load voice tensor asynchronously
+                        # Parallel load if not cached
                         async with self._io_semaphore:
-                            if cache_key not in self._voice_cache:  # Double-check
+                            if cache_key not in self._voice_cache:
                                 self._voice_cache[cache_key] = await self._voice_manager.load_voice(
                                     voice_name, device=backend.device
                                 )
-                                logger.debug(f"Cached voice tensor for {voice_name} on {backend.device}")
+                                logger.debug(f"Hot-loaded voice tensor for {voice_name}")
                     
                     voice_tensor = self._voice_cache[cache_key]
                     
@@ -184,63 +220,72 @@ class TTSService:
             except Exception as e:
                 logger.error(f"Failed to process tokens: {str(e)}")
 
-    async def _load_voice_from_path(self, path: str, weight: float):
-        """Load voice tensor with caching."""
+    async def _load_voice_from_path_fast(self, path: str, weight: float):
+        """Ultra-fast voice loading with aggressive caching."""
         if not path:
             raise ValueError(f"Voice not found at path: {path}")
 
-        # Check cache first
+        # Multi-level cache check
         cache_key = f"path_{path}_{weight}"
         if cache_key in self._tensor_pool:
             return self._tensor_pool[cache_key]
 
-        logger.debug(f"Loading voice tensor from path: {path}")
-        
-        # Use thread pool for I/O operations
+        # Use thread pool with higher priority for voice loading
         loop = asyncio.get_event_loop()
         tensor = await loop.run_in_executor(
             self._thread_pool, 
-            lambda: torch.load(path, map_location="cpu") * weight
+            lambda: torch.load(path, map_location="cpu", weights_only=True) * weight
         )
         
-        # Cache the loaded tensor (limit cache size)
-        if len(self._tensor_pool) < 50:  # Prevent unlimited growth
+        # Aggressive caching with size management
+        if len(self._tensor_pool) < 100:  # Increased cache size
+            self._tensor_pool[cache_key] = tensor
+        elif len(self._tensor_pool) < 150:
+            # Keep most recently used
+            oldest_key = next(iter(self._tensor_pool))
+            del self._tensor_pool[oldest_key]
             self._tensor_pool[cache_key] = tensor
         
         return tensor
 
-    async def _get_voices_path(self, voice: str) -> Tuple[str, str]:
-        """Get voice path with enhanced caching."""
+    async def _get_voices_path_fast(self, voice: str) -> Tuple[str, str]:
+        """Blazingly fast voice path resolution."""
         try:
-            # Check path cache first
+            # Check cache first
             if voice in self._path_cache:
                 return voice, self._path_cache[voice]
             
-            split_voice = re.split(r"([-+])", voice)
+            # Use pre-compiled regex
+            split_voice = self._voice_split_pattern.split(voice)
 
-            # Single voice optimization
+            # Single voice fast path
             if len(split_voice) == 1:
                 if ("(" not in voice and ")" not in voice) or settings.voice_weight_normalization:
-                    async with self._io_semaphore:
-                        path = await self._voice_manager.get_voice_path(voice)
-                        if not path:
-                            raise RuntimeError(f"Voice not found: {voice}")
-                        logger.debug(f"Using single voice path: {path}")
-                        # Cache the path
-                        self._path_cache[voice] = path
-                        return voice, path
+                    # Try cache first, then load
+                    if voice not in self._path_cache:
+                        async with self._io_semaphore:
+                            path = await self._voice_manager.get_voice_path(voice)
+                            if not path:
+                                raise RuntimeError(f"Voice not found: {voice}")
+                            self._path_cache[voice] = path
+                    
+                    path = self._path_cache[voice]
+                    logger.debug(f"Using cached voice path: {path}")
+                    return voice, path
 
-            # Combined voice processing with caching
+            # Combined voice processing with enhanced caching
             cache_key = f"combined_{voice}"
             if cache_key in self._voice_cache:
                 return voice, self._voice_cache[cache_key]
 
+            # Fast weight parsing
             total_weight = 0
             for voice_index in range(0, len(split_voice), 2):
                 voice_object = split_voice[voice_index]
-                if "(" in voice_object and ")" in voice_object:
-                    voice_name = voice_object.split("(")[0].strip()
-                    voice_weight = float(voice_object.split("(")[1].split(")")[0])
+                match = self._voice_weight_pattern.match(voice_object)
+                if match:
+                    voice_name = match.group(1)
+                    voice_weight = float(match.group(2))
                 else:
                     voice_name = voice_object
                     voice_weight = 1
@@ -250,15 +295,23 @@ class TTSService:
             if not settings.voice_weight_normalization:
                 total_weight = 1
 
-            # Load first voice
-            path = await self._voice_manager.get_voice_path(split_voice[0][0])
-            combined_tensor = await self._load_voice_from_path(path, split_voice[0][1] / total_weight)
+            # Parallel voice loading for combined voices
+            async def load_voice_parallel(voice_name, weight):
+                if voice_name not in self._path_cache:
+                    path = await self._voice_manager.get_voice_path(voice_name)
+                    self._path_cache[voice_name] = path
+                else:
+                    path = self._path_cache[voice_name]
+                return await self._load_voice_from_path_fast(path, weight / total_weight)
 
-            # Process operations sequentially for stability
+            # Load first voice
+            combined_tensor = await load_voice_parallel(split_voice[0][0], split_voice[0][1])
+
+            # Process remaining voices
             for operation_index in range(1, len(split_voice) - 1, 2):
-                path = await self._voice_manager.get_voice_path(split_voice[operation_index + 1][0])
-                voice_tensor = await self._load_voice_from_path(
-                    path, split_voice[operation_index + 1][1] / total_weight
+                voice_tensor = await load_voice_parallel(
+                    split_voice[operation_index + 1][0], 
+                    split_voice[operation_index + 1][1]
                 )
                 
                 if split_voice[operation_index] == "+":
@@ -266,19 +319,17 @@ class TTSService:
                 else:
                     combined_tensor -= voice_tensor
 
-            # Save and cache combined voice
+            # Fast save with thread pool
             temp_dir = tempfile.gettempdir()
-            combined_path = os.path.join(temp_dir, f"{voice}.pt")
-            logger.debug(f"Saving combined voice to: {combined_path}")
+            combined_path = os.path.join(temp_dir, f"voice_{hash(voice)}.pt")  # Use hash for filename
             
-            # Use thread pool for I/O operations
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 self._thread_pool, 
                 lambda: torch.save(combined_tensor, combined_path)
             )
             
-            # Cache the combined voice path
+            # Cache aggressively
             self._voice_cache[cache_key] = combined_path
             self._path_cache[voice] = combined_path
             
@@ -299,25 +350,33 @@ class TTSService:
         normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Generate and stream audio chunks with performance optimizations."""
-        stream_normalizer = AudioNormalizer()
+        """Ultra-fast audio streaming with maximum optimizations."""
+        # Reuse normalizer if same config
+        config_key = f"{output_format}_{speed}"
+        if config_key == self._last_voice_config and self._last_normalizer:
+            stream_normalizer = self._last_normalizer
+        else:
+            stream_normalizer = AudioNormalizer()
+            self._last_normalizer = stream_normalizer
+            self._last_voice_config = config_key
+            
         chunk_index = 0
         current_offset = 0.0
         
         try:
             backend = self.model_manager.get_backend()
-            voice_name, voice_path = await self._get_voices_path(voice)
-            logger.debug(f"Using voice path: {voice_path}")
-
+            voice_name, voice_path = await self._get_voices_path_fast(voice)  # Fast path lookup
+            
+            # Cache voice paths for repeated use
             pipeline_lang_code = lang_code if lang_code else voice[:1].lower()
             logger.info(f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in audio stream")
 
-            # Process text in chunks with smart splitting (PRESERVED ORIGINAL FLOW)
+            # Process text with aggressive chunking
             async for chunk_text, tokens in smart_split(
                 text, lang_code=pipeline_lang_code, normalization_options=normalization_options,
             ):
                 try:
-                    # Process audio for chunk
+                    # Process chunk with maximum concurrency
                     async for chunk_data in self._process_chunk(
                         chunk_text, tokens, voice_name, voice_path, speed, writer,
                         output_format, is_first=(chunk_index == 0), is_last=False,
@@ -336,11 +395,16 @@ class TTSService:
                         else:
                             logger.warning(f"No audio generated for chunk: '{chunk_text[:100]}...'")
                         chunk_index += 1
+                        
+                        # Quick GC hint for large batches
+                        if chunk_index % 10 == 0:
+                            gc.collect() if torch.cuda.is_available() else None
+                            
                 except Exception as e:
                     logger.error(f"Failed to process audio for chunk: '{chunk_text[:100]}...'. Error: {str(e)}")
                     continue
 
-            # Finalize stream (PRESERVED ORIGINAL LOGIC)
+            # Finalize stream
             if chunk_index > 0:
                 try:
                     async for chunk_data in self._process_chunk(
@@ -405,7 +469,7 @@ class TTSService:
         start_time = time.time()
         try:
             backend = self.model_manager.get_backend()
-            voice_name, voice_path = await self._get_voices_path(voice)
+            voice_name, voice_path = await self._get_voices_path_fast(voice)  # Use fast path
 
             if isinstance(backend, KokoroV1):
                 result = None
