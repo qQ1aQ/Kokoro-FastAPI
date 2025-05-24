@@ -28,9 +28,8 @@ from .text_processing.text_processor import process_text_chunk, smart_split
 class TTSService:
     """Text-to-speech service."""
 
-    # Significantly increased concurrent processing for GPU utilization
-    _chunk_semaphore = asyncio.Semaphore(32)  # Increased from 16 to 32
-    _batch_semaphore = asyncio.Semaphore(8)   # New batch processing
+    # Aggressive concurrent processing for GPU utilization
+    _chunk_semaphore = asyncio.Semaphore(32)  # High concurrency
     _io_semaphore = asyncio.Semaphore(16)     # Separate semaphore for I/O operations
     
     # Enhanced caching
@@ -79,61 +78,6 @@ class TTSService:
                     logger.debug(f"Could not pre-warm voice {voice_name}: {e}")
         except Exception as e:
             logger.debug(f"Voice pre-warming failed: {e}")
-
-    async def _process_chunk_batch(
-        self,
-        chunks: List[Tuple],  # List of chunk parameters
-        writer: StreamingAudioWriter,
-    ) -> AsyncGenerator[List[AudioChunk], None]:
-        """Process multiple chunks in parallel for better GPU utilization."""
-        async with self._batch_semaphore:
-            try:
-                # Create tasks for parallel processing
-                tasks = []
-                for chunk_params in chunks:
-                    task = asyncio.create_task(self._process_single_chunk(*chunk_params))
-                    tasks.append(task)
-                
-                # Wait for all chunks to complete
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Filter successful results
-                successful_chunks = []
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.error(f"Chunk processing failed: {result}")
-                        continue
-                    if result:
-                        successful_chunks.extend(result)
-                
-                if successful_chunks:
-                    yield successful_chunks
-                    
-            except Exception as e:
-                logger.error(f"Batch processing failed: {e}")
-
-    async def _process_single_chunk(
-        self,
-        chunk_text: str,
-        tokens: List[int],
-        voice_name: str,
-        voice_path: str,
-        speed: float,
-        output_format: Optional[str] = None,
-        is_first: bool = False,
-        is_last: bool = False,
-        normalizer: Optional[AudioNormalizer] = None,
-        lang_code: Optional[str] = None,
-        return_timestamps: Optional[bool] = False,
-    ) -> List[AudioChunk]:
-        """Process a single chunk and return list of audio chunks."""
-        chunks = []
-        async for chunk in self._process_chunk(
-            chunk_text, tokens, voice_name, voice_path, speed, None,  # No writer for batch
-            output_format, is_first, is_last, normalizer, lang_code, return_timestamps
-        ):
-            chunks.append(chunk)
-        return chunks
 
     async def _process_chunk(
         self,
@@ -251,10 +195,18 @@ class TTSService:
             return self._tensor_pool[cache_key]
 
         logger.debug(f"Loading voice tensor from path: {path}")
-        tensor = torch.load(path, map_location="cpu") * weight
         
-        # Cache the loaded tensor
-        self._tensor_pool[cache_key] = tensor
+        # Use thread pool for I/O operations
+        loop = asyncio.get_event_loop()
+        tensor = await loop.run_in_executor(
+            self._thread_pool, 
+            lambda: torch.load(path, map_location="cpu") * weight
+        )
+        
+        # Cache the loaded tensor (limit cache size)
+        if len(self._tensor_pool) < 50:  # Prevent unlimited growth
+            self._tensor_pool[cache_key] = tensor
+        
         return tensor
 
     async def _get_voices_path(self, voice: str) -> Tuple[str, str]:
@@ -269,13 +221,14 @@ class TTSService:
             # Single voice optimization
             if len(split_voice) == 1:
                 if ("(" not in voice and ")" not in voice) or settings.voice_weight_normalization:
-                    path = await self._voice_manager.get_voice_path(voice)
-                    if not path:
-                        raise RuntimeError(f"Voice not found: {voice}")
-                    logger.debug(f"Using single voice path: {path}")
-                    # Cache the path
-                    self._path_cache[voice] = path
-                    return voice, path
+                    async with self._io_semaphore:
+                        path = await self._voice_manager.get_voice_path(voice)
+                        if not path:
+                            raise RuntimeError(f"Voice not found: {voice}")
+                        logger.debug(f"Using single voice path: {path}")
+                        # Cache the path
+                        self._path_cache[voice] = path
+                        return voice, path
 
             # Combined voice processing with caching
             cache_key = f"combined_{voice}"
@@ -297,19 +250,15 @@ class TTSService:
             if not settings.voice_weight_normalization:
                 total_weight = 1
 
-            # Parallel voice loading for combined voices
-            async def load_voice_async(voice_name, weight):
-                path = await self._voice_manager.get_voice_path(voice_name)
-                return await self._load_voice_from_path(path, weight / total_weight)
-
             # Load first voice
-            combined_tensor = await load_voice_async(split_voice[0][0], split_voice[0][1])
+            path = await self._voice_manager.get_voice_path(split_voice[0][0])
+            combined_tensor = await self._load_voice_from_path(path, split_voice[0][1] / total_weight)
 
-            # Process operations
+            # Process operations sequentially for stability
             for operation_index in range(1, len(split_voice) - 1, 2):
-                voice_tensor = await load_voice_async(
-                    split_voice[operation_index + 1][0], 
-                    split_voice[operation_index + 1][1]
+                path = await self._voice_manager.get_voice_path(split_voice[operation_index + 1][0])
+                voice_tensor = await self._load_voice_from_path(
+                    path, split_voice[operation_index + 1][1] / total_weight
                 )
                 
                 if split_voice[operation_index] == "+":
@@ -350,7 +299,7 @@ class TTSService:
         normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Generate and stream audio chunks with batch processing."""
+        """Generate and stream audio chunks with performance optimizations."""
         stream_normalizer = AudioNormalizer()
         chunk_index = 0
         current_offset = 0.0
@@ -363,55 +312,35 @@ class TTSService:
             pipeline_lang_code = lang_code if lang_code else voice[:1].lower()
             logger.info(f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in audio stream")
 
-            # Collect chunks for batch processing
-            chunk_params_batch = []
-            batch_size = 4  # Process 4 chunks at a time
-            
+            # Process text in chunks with smart splitting (PRESERVED ORIGINAL FLOW)
             async for chunk_text, tokens in smart_split(
                 text, lang_code=pipeline_lang_code, normalization_options=normalization_options,
             ):
-                chunk_params = (
-                    chunk_text, tokens, voice_name, voice_path, speed,
-                    output_format, (chunk_index == 0), False,  # is_first, is_last
-                    stream_normalizer, pipeline_lang_code, return_timestamps
-                )
-                chunk_params_batch.append(chunk_params)
-                
-                # Process batch when it's full or if it's the last chunk
-                if len(chunk_params_batch) >= batch_size:
-                    async for batch_results in self._process_chunk_batch(chunk_params_batch, writer):
-                        for chunk_data in batch_results:
-                            if chunk_data.word_timestamps:
-                                for timestamp in chunk_data.word_timestamps:
-                                    timestamp.start_time += current_offset
-                                    timestamp.end_time += current_offset
-                            
-                            current_offset += len(chunk_data.audio) / 24000
-                            
-                            if chunk_data.output is not None:
-                                yield chunk_data
-                            else:
-                                logger.warning(f"No audio generated for chunk")
-                            chunk_index += 1
-                    
-                    chunk_params_batch = []  # Reset batch
-
-            # Process remaining chunks
-            if chunk_params_batch:
-                async for batch_results in self._process_chunk_batch(chunk_params_batch, writer):
-                    for chunk_data in batch_results:
-                        if chunk_data.word_timestamps:
+                try:
+                    # Process audio for chunk
+                    async for chunk_data in self._process_chunk(
+                        chunk_text, tokens, voice_name, voice_path, speed, writer,
+                        output_format, is_first=(chunk_index == 0), is_last=False,
+                        normalizer=stream_normalizer, lang_code=pipeline_lang_code,
+                        return_timestamps=return_timestamps,
+                    ):
+                        if chunk_data.word_timestamps is not None:
                             for timestamp in chunk_data.word_timestamps:
                                 timestamp.start_time += current_offset
                                 timestamp.end_time += current_offset
-                        
+
                         current_offset += len(chunk_data.audio) / 24000
-                        
+
                         if chunk_data.output is not None:
                             yield chunk_data
+                        else:
+                            logger.warning(f"No audio generated for chunk: '{chunk_text[:100]}...'")
                         chunk_index += 1
+                except Exception as e:
+                    logger.error(f"Failed to process audio for chunk: '{chunk_text[:100]}...'. Error: {str(e)}")
+                    continue
 
-            # Finalize stream
+            # Finalize stream (PRESERVED ORIGINAL LOGIC)
             if chunk_index > 0:
                 try:
                     async for chunk_data in self._process_chunk(
