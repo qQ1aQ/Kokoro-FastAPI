@@ -25,10 +25,18 @@ from .text_processing.text_processor import process_text_chunk, smart_split
 
 
 class TTSService:
-    """Text-to-speech service."""
+    """Text-to-speech service optimized for high GPU utilization."""
 
-    # Limit concurrent chunk processing
-    _chunk_semaphore = asyncio.Semaphore(4)
+    # Significantly increase concurrent chunk processing for GPU utilization
+    # RunPod GPUs can handle much more parallel processing
+    _chunk_semaphore = asyncio.Semaphore(32)  # Increased from 4 to 32
+    
+    # Add batch processing semaphore for multiple requests
+    _batch_semaphore = asyncio.Semaphore(8)  # Allow 8 concurrent batch requests
+    
+    # Voice cache to avoid repeated loading
+    _voice_cache = {}
+    _voice_cache_lock = asyncio.Lock()
 
     def __init__(self, output_dir: str = None):
         """Initialize service."""
@@ -43,6 +51,53 @@ class TTSService:
         service.model_manager = await get_model_manager()
         service._voice_manager = await get_voice_manager()
         return service
+
+    async def _process_chunk_batch(
+        self,
+        chunks: List[Tuple[str, List[int]]],
+        voice_name: str,
+        voice_path: str,
+        speed: float,
+        writer: StreamingAudioWriter,
+        output_format: Optional[str] = None,
+        normalizer: Optional[AudioNormalizer] = None,
+        lang_code: Optional[str] = None,
+        return_timestamps: Optional[bool] = False,
+    ) -> AsyncGenerator[List[AudioChunk], None]:
+        """Process multiple chunks in parallel for maximum GPU utilization."""
+        async with self._batch_semaphore:
+            try:
+                # Process chunks in parallel using asyncio.gather
+                tasks = []
+                for i, (chunk_text, tokens) in enumerate(chunks):
+                    task = self._process_chunk(
+                        chunk_text,
+                        tokens,
+                        voice_name,
+                        voice_path,
+                        speed,
+                        writer,
+                        output_format,
+                        is_first=(i == 0),
+                        is_last=(i == len(chunks) - 1),
+                        normalizer=normalizer,
+                        lang_code=lang_code,
+                        return_timestamps=return_timestamps,
+                    )
+                    tasks.append(task)
+                
+                # Execute all chunks in parallel
+                batch_results = []
+                async for chunk_results in asyncio.as_completed(tasks):
+                    chunk_data_list = []
+                    async for chunk_data in chunk_results:
+                        chunk_data_list.append(chunk_data)
+                    batch_results.append(chunk_data_list)
+                
+                yield batch_results
+                
+            except Exception as e:
+                logger.error(f"Failed to process chunk batch: {str(e)}")
 
     async def _process_chunk(
         self,
@@ -59,7 +114,8 @@ class TTSService:
         lang_code: Optional[str] = None,
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Process tokens into audio."""
+        """Process tokens into audio with GPU optimization."""
+        # Reduce semaphore contention for better GPU utilization
         async with self._chunk_semaphore:
             try:
                 # Handle stream finalization
@@ -122,9 +178,9 @@ class TTSService:
                             yield chunk_data
                         chunk_index += 1
                 else:
-                    # For legacy backends, load voice tensor
-                    voice_tensor = await self._voice_manager.load_voice(
-                        voice_name, device=backend.device
+                    # For legacy backends, load voice tensor with caching
+                    voice_tensor = await self._get_cached_voice_tensor(
+                        voice_name, backend.device
                     )
                     chunk_data = await self.model_manager.generate(
                         tokens,
@@ -164,6 +220,24 @@ class TTSService:
             except Exception as e:
                 logger.error(f"Failed to process tokens: {str(e)}")
 
+    async def _get_cached_voice_tensor(self, voice_name: str, device: str) -> torch.Tensor:
+        """Get cached voice tensor to avoid repeated loading."""
+        cache_key = f"{voice_name}_{device}"
+        
+        async with self._voice_cache_lock:
+            if cache_key not in self._voice_cache:
+                logger.debug(f"Loading and caching voice tensor: {voice_name}")
+                voice_tensor = await self._voice_manager.load_voice(voice_name, device=device)
+                self._voice_cache[cache_key] = voice_tensor
+                # Limit cache size to prevent memory issues
+                if len(self._voice_cache) > 20:  # Keep only 20 most recent voices
+                    oldest_key = next(iter(self._voice_cache))
+                    del self._voice_cache[oldest_key]
+            else:
+                logger.debug(f"Using cached voice tensor: {voice_name}")
+            
+            return self._voice_cache[cache_key]
+
     async def _load_voice_from_path(self, path: str, weight: float):
         # Check if the path is None and raise a ValueError if it is not
         if not path:
@@ -173,7 +247,7 @@ class TTSService:
         return torch.load(path, map_location="cpu") * weight
 
     async def _get_voices_path(self, voice: str) -> Tuple[str, str]:
-        """Get voice path, handling combined voices.
+        """Get voice path, handling combined voices with GPU optimization.
 
         Args:
             voice: Voice name or combined voice names (e.g., 'af_jadzia+af_jessica')
@@ -219,11 +293,16 @@ class TTSService:
             if settings.voice_weight_normalization == False:
                 total_weight = 1
 
-            # Load the first voice as the starting point for voices to be combined onto
+            # Load the first voice as the starting point for voices to be combined onto - optimize for GPU
             path = await self._voice_manager.get_voice_path(split_voice[0][0])
             combined_tensor = await self._load_voice_from_path(
                 path, split_voice[0][1] / total_weight
             )
+            
+            # Move to GPU immediately for faster operations
+            device = self.model_manager.get_backend().device
+            if device != "cpu":
+                combined_tensor = combined_tensor.to(device)
 
             # Loop through each + or - in split_voice so they can be applied to combined voice
             for operation_index in range(1, len(split_voice) - 1, 2):
@@ -234,6 +313,10 @@ class TTSService:
                 voice_tensor = await self._load_voice_from_path(
                     path, split_voice[operation_index + 1][1] / total_weight
                 )
+                
+                # Move to same device for faster operations
+                if device != "cpu":
+                    voice_tensor = voice_tensor.to(device)
 
                 # Either add or subtract the voice from the current combined voice
                 if split_voice[operation_index] == "+":
@@ -245,7 +328,8 @@ class TTSService:
             temp_dir = tempfile.gettempdir()
             combined_path = os.path.join(temp_dir, f"{voice}.pt")
             logger.debug(f"Saving combined voice to: {combined_path}")
-            torch.save(combined_tensor, combined_path)
+            # Save on CPU for portability
+            torch.save(combined_tensor.cpu(), combined_path)
             return voice, combined_path
         except Exception as e:
             logger.error(f"Failed to get voice path: {e}")
@@ -262,7 +346,7 @@ class TTSService:
         normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Generate and stream audio chunks."""
+        """Generate and stream audio chunks with optimized GPU utilization."""
         stream_normalizer = AudioNormalizer()
         chunk_index = 0
         current_offset = 0.0
@@ -280,47 +364,65 @@ class TTSService:
                 f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in audio stream"
             )
 
-            # Process text in chunks with smart splitting
+            # Collect chunks for batch processing
+            chunks = []
             async for chunk_text, tokens in smart_split(
                 text,
                 lang_code=pipeline_lang_code,
                 normalization_options=normalization_options,
             ):
+                chunks.append((chunk_text, tokens))
+
+            # Process chunks in batches for better GPU utilization
+            batch_size = min(8, len(chunks))  # Process up to 8 chunks simultaneously
+            for i in range(0, len(chunks), batch_size):
+                batch_chunks = chunks[i:i + batch_size]
+                
                 try:
-                    # Process audio for chunk
-                    async for chunk_data in self._process_chunk(
-                        chunk_text,  # Pass text for Kokoro V1
-                        tokens,  # Pass tokens for legacy backends
-                        voice_name,  # Pass voice name
-                        voice_path,  # Pass voice path
-                        speed,
-                        writer,
-                        output_format,
-                        is_first=(chunk_index == 0),
-                        is_last=False,  # We'll update the last chunk later
-                        normalizer=stream_normalizer,
-                        lang_code=pipeline_lang_code,  # Pass lang_code
-                        return_timestamps=return_timestamps,
-                    ):
-                        if chunk_data.word_timestamps is not None:
-                            for timestamp in chunk_data.word_timestamps:
-                                timestamp.start_time += current_offset
-                                timestamp.end_time += current_offset
+                    # Process batch of chunks in parallel
+                    tasks = []
+                    for j, (chunk_text, tokens) in enumerate(batch_chunks):
+                        task = self._process_chunk(
+                            chunk_text,
+                            tokens,
+                            voice_name,
+                            voice_path,
+                            speed,
+                            writer,
+                            output_format,
+                            is_first=(chunk_index == 0),
+                            is_last=(i + j == len(chunks) - 1),
+                            normalizer=stream_normalizer,
+                            lang_code=pipeline_lang_code,
+                            return_timestamps=return_timestamps,
+                        )
+                        tasks.append({'task': task, 'text': chunk_text})
+                    
+                    # Process tasks and yield results in order
+                    for task_info in tasks:
+                        try:
+                            async for chunk_data in task_info['task']:
+                                if chunk_data.word_timestamps is not None:
+                                    for timestamp in chunk_data.word_timestamps:
+                                        timestamp.start_time += current_offset
+                                        timestamp.end_time += current_offset
 
-                        current_offset += len(chunk_data.audio) / 24000
+                                current_offset += len(chunk_data.audio) / 24000
 
-                        if chunk_data.output is not None:
-                            yield chunk_data
-
-                        else:
-                            logger.warning(
-                                f"No audio generated for chunk: '{chunk_text[:100]}...'"
+                                if chunk_data.output is not None:
+                                    yield chunk_data
+                                else:
+                                    logger.warning(
+                                        f"No audio generated for chunk: '{task_info['text'][:100]}...'"
+                                    )
+                                chunk_index += 1
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to process audio for chunk: '{task_info['text'][:100]}...'. Error: {str(e)}"
                             )
-                        chunk_index += 1
+                            continue
                 except Exception as e:
-                    logger.error(
-                        f"Failed to process audio for chunk: '{chunk_text[:100]}...'. Error: {str(e)}"
-                    )
+                    logger.error(f"Failed to process batch: {str(e)}")
                     continue
 
             # Only finalize if we successfully processed at least one chunk
@@ -457,3 +559,17 @@ class TTSService:
         except Exception as e:
             logger.error(f"Error in phoneme audio generation: {str(e)}")
             raise
+
+    @classmethod
+    def clear_voice_cache(cls):
+        """Clear the voice tensor cache to free memory."""
+        cls._voice_cache.clear()
+        logger.info("Voice cache cleared")
+
+    @classmethod
+    def get_cache_stats(cls) -> dict:
+        """Get voice cache statistics."""
+        return {
+            "cached_voices": len(cls._voice_cache),
+            "cache_keys": list(cls._voice_cache.keys())
+        }
