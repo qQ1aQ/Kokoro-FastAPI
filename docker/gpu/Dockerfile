@@ -2,7 +2,7 @@ FROM --platform=$BUILDPLATFORM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
 # Set non-interactive frontend
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Python and other dependencies with proper FFmpeg
+# Install Python and other dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-venv \
@@ -12,11 +12,6 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 \
     curl \
     ffmpeg \
-    libavcodec-extra \
-    libavformat-dev \
-    libavutil-dev \
-    libswscale-dev \
-    libswresample-dev \
     g++ \
  && apt-get clean && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /usr/share/espeak-ng-data \
@@ -52,6 +47,7 @@ COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser web ./web
 COPY --chown=appuser:appuser docker/scripts/ ./
 RUN chmod +x ./entrypoint.sh
+
 
 # Set all environment variables in one go
 ENV PYTHONUNBUFFERED=1 \
