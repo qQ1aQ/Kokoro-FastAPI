@@ -29,8 +29,8 @@ class TTSService:
     """Text-to-speech service."""
 
     # Aggressive concurrent processing for GPU utilization
-    _chunk_semaphore = asyncio.Semaphore(32)  # High concurrency
-    _io_semaphore = asyncio.Semaphore(16)     # Separate semaphore for I/O operations
+    _chunk_semaphore = asyncio.Semaphore(64)  # High concurrency   #32
+    _io_semaphore = asyncio.Semaphore(32)     # Separate semaphore for I/O operations  #16
     
     # Enhanced caching
     _voice_cache = {}
