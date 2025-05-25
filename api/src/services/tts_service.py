@@ -37,8 +37,8 @@ class TTSService:
     _path_cache = {}  # Cache for voice paths
     _tensor_pool = {}  # Pre-loaded tensor pool
     
-    # Thread pool for CPU-bound operations  #4
-    _thread_pool = ThreadPoolExecutor(max_workers=8)
+    # Thread pool for CPU-bound operations  #4 #8
+    _thread_pool = ThreadPoolExecutor(max_workers=16)
 
     def __init__(self, output_dir: str = None):
         """Initialize service."""
